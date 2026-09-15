@@ -74,9 +74,9 @@ test('server: routes, admin gating, oversize body, unknown ws path', async () =>
   const list = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
   for (const n of ['federation_sync', 'claims_status', 'federation_invite_mint', 'federation_admit']) assert.ok(list.includes(`"name":"${n}"`), n);
   const noTok = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'claims_issue', arguments: { resourceId: 'x' } } });
-  assert.match(noTok, /admin token required|invalid_type|Required/);   // rejected: missing/invalid adminToken
+  assert.match(noTok, /no write credential|admin token required|invalid_type|Required/);   // rejected: no write credential
   const badTok = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'claims_issue', arguments: { resourceId: 'x', adminToken: 'wrong' } } });
-  assert.match(badTok, /admin token required or invalid/);
+  assert.match(badTok, /no write credential|admin token required|invalid_type|Required/);
   const big = await fetch(base + '/mcp', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(MAX_BODY + 10) }, body: 'x'.repeat(MAX_BODY + 10) }).catch(() => ({ status: 413 }));
   assert.equal(big.status, 413);
   gw.server.close();
@@ -148,6 +148,69 @@ test('hardening: publish bounds, bucket eviction, ws maxPayload/404, fetchManyOn
   assert.equal(out.length, 3); assert.equal(handshakes, 1); assert.equal(reqs, 3);
 });
 
+test('security: verified pubkey/id/created_at cannot be overridden by spoofed content (fetchRecent, fetchManyOn, fetchChannel)', async () => {
+  const { fetchRecent, fetchManyOn, fetchChannel } = await import('../src/nostr-federation.mjs');
+  const attacker = generateSecretKey(); const attackerPk = getPublicKey(attacker);
+  const victimPk = getPublicKey(generateSecretKey());
+  // Signed legitimately under the attacker's OWN key, but the JSON content
+  // claims to be a ClaimReleased from the victim — this is exactly what
+  // reduceClaims would need to see to let the attacker forge a release/handoff.
+  const spoofContent = JSON.stringify({ type: 'ClaimReleased', pubkey: victimPk, id: 'f'.repeat(64), created_at: 1, resourceId: 'r1' });
+
+  // fetchRecent
+  let wss = new WebSocketServer({ port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+  wss.on('connection', (s) => { s.send(JSON.stringify(['AUTH', 'c'])); s.on('message', (d) => {
+    const m = JSON.parse(d);
+    if (m[0] === 'AUTH') s.send(JSON.stringify(['OK', m[1].id, true, '']));
+    if (m[0] === 'REQ') {
+      const ev = finalizeEvent({ kind: 1, created_at: 1000, tags: [], content: spoofContent }, attacker);
+      s.send(JSON.stringify(['EVENT', m[1], ev]));
+      s.send(JSON.stringify(['EOSE', m[1]]));
+    }
+  }); });
+  let out = await fetchRecent(`ws://127.0.0.1:${wss.address().port}`, generateSecretKey(), {});
+  wss.close();
+  assert.equal(out.length, 1);
+  assert.equal(out[0].pubkey, attackerPk, 'fetchRecent: verified pubkey must win over spoofed content.pubkey');
+  assert.notEqual(out[0].pubkey, victimPk);
+  assert.equal(out[0].created_at, 1000, 'fetchRecent: verified created_at must win over spoofed content.created_at');
+
+  // fetchManyOn (per-filter 'qN' REQ ids)
+  wss = new WebSocketServer({ port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+  wss.on('connection', (s) => { s.send(JSON.stringify(['AUTH', 'c'])); s.on('message', (d) => {
+    const m = JSON.parse(d);
+    if (m[0] === 'AUTH') s.send(JSON.stringify(['OK', m[1].id, true, '']));
+    if (m[0] === 'REQ') {
+      const ev = finalizeEvent({ kind: 1, created_at: 1000, tags: [], content: spoofContent }, attacker);
+      s.send(JSON.stringify(['EVENT', m[1], ev]));
+      s.send(JSON.stringify(['EOSE', m[1]]));
+    }
+  }); });
+  const [many] = await fetchManyOn(`ws://127.0.0.1:${wss.address().port}`, generateSecretKey(), [{ limit: 1 }]);
+  wss.close();
+  assert.equal(many.length, 1);
+  assert.equal(many[0].pubkey, attackerPk, 'fetchManyOn: verified pubkey must win over spoofed content.pubkey');
+
+  // fetchChannel (plaintext branch)
+  wss = new WebSocketServer({ port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+  wss.on('connection', (s) => { s.send(JSON.stringify(['AUTH', 'c'])); s.on('message', (d) => {
+    const m = JSON.parse(d);
+    if (m[0] === 'AUTH') s.send(JSON.stringify(['OK', m[1].id, true, '']));
+    if (m[0] === 'REQ') {
+      const ev = finalizeEvent({ kind: 1, created_at: 1000, tags: [['c', 'pub:ops'], ['k', 'ClaimReleased']], content: spoofContent }, attacker);
+      s.send(JSON.stringify(['EVENT', m[1], ev]));
+      s.send(JSON.stringify(['EOSE', m[1]]));
+    }
+  }); });
+  const chan = await fetchChannel(`ws://127.0.0.1:${wss.address().port}`, generateSecretKey(), { channelId: 'pub:ops' });
+  wss.close();
+  assert.equal(chan.length, 1);
+  assert.equal(chan[0].pubkey, attackerPk, 'fetchChannel: verified pubkey must win over spoofed content.pubkey');
+});
+
 // ---- ADR-386 channels ----
 test('channels: ids, seal/open, non-member cannot open, type hidden on private', async () => {
   const c = await import('../src/channels.mjs');
@@ -194,7 +257,7 @@ test('channels: tools are registered, private publish refused, ids validated', a
 
   // channel_publish is admin-gated like every other gateway-identity write
   const noTok = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'channel_publish', arguments: { channel: 'pub:ops', msgType: 'Status', payload: {} } } });
-  assert.match(noTok, /admin token required|invalid_type|Required/);
+  assert.match(noTok, /no write credential|admin token required|invalid_type|Required/);
 
   // the gateway refuses to publish to a private channel: it holds no channel key
   const priv = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'channel_publish', arguments: { channel: 'prv:0123456789abcdef', msgType: 'Status', payload: {}, adminToken: 'test-admin-token' } } });
@@ -301,12 +364,22 @@ test('seraphina: the tool answers without adminToken while claims_issue still re
   const sera = JSON.parse(list.slice(list.indexOf('{'))).result.tools.find((t) => t.name === 'seraphina_guidance');
   assert.ok(sera, 'seraphina_guidance must be registered');
   assert.ok(!(sera.inputSchema.required || []).includes('adminToken'), 'adminToken must not be required');
+  // adminToken is no longer REQUIRED in the schema — ADR-388 added a second write
+  // credential (an access token carrying swarm:publish), and a required argument
+  // would reject every OAuth-authorised write at validation before the handler
+  // could consider the token. The protection moved to the handler, so assert it
+  // THERE rather than dropping it: with neither credential, the write is refused.
   const gatedWrite = JSON.parse(list.slice(list.indexOf('{'))).result.tools.find((t) => t.name === 'claims_issue');
-  assert.ok((gatedWrite.inputSchema.required || []).includes('adminToken'), 'writes must still require it');
+  assert.ok(!(gatedWrite.inputSchema.required || []).includes('adminToken'),
+    'adminToken must be optional so an OAuth-authorised write can be attempted');
+  const refused = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'claims_issue', arguments: { resourceId: 'r1' } } });
+  assert.match(refused, /no write credential|admin token required|invalid_type|Required/,
+    'a write with neither credential must still be refused, at the handler');
 
   // The write path is unchanged: still refused without a token.
   const write = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'claims_issue', arguments: { resourceId: 'x' } } });
-  assert.match(write, /admin token required|invalid_type|Required/);
+  assert.match(write, /no write credential|admin token required|invalid_type|Required/);
 
   gw.server.close();
 });
@@ -358,7 +431,7 @@ test('onboarding: exposed as an open tool and an open resource', async () => {
 
   // Callable with no arguments and no token at all.
   const called = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'federation_onboarding', arguments: {} } });
-  assert.doesNotMatch(called, /admin token required or invalid/);
+  assert.doesNotMatch(called, /no write credential|admin token required|invalid_type|Required/);
   assert.match(called, /readThisFirst/);
 
   const info = await (await fetch(base + '/')).json();
@@ -385,10 +458,10 @@ const EXPECTED_ANNOTATIONS = {
   channel_list:           { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
   channel_sync:           { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
   federation_onboarding:  { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-  // Additive writes onto our own relay: each call appends a new event.
-  federation_join:        { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  federation_publish:     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  channel_publish:        { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Irreversible sends: these append signed events that cannot be retracted.
+  federation_join:        { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: false },
+  federation_publish:     { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: false },
+  channel_publish:        { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: false },
   claims_issue:           { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   federation_invite_mint: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   // Additive but idempotent: same pubkey + role leaves the roster identical.
@@ -469,13 +542,13 @@ test('annotations: readOnlyHint agrees with the server read/write split', async 
   }
 });
 
-test('annotations: destructiveHint is reserved for tools that remove state', async () => {
+test('annotations: destructiveHint marks removals and irreversible external sends', async () => {
   const tools = await listToolsOverHttp();
   // Blanket-setting destructive is exactly as misleading as omitting it.
   assert.deepEqual(
     tools.filter((t) => t.annotations.destructiveHint).map((t) => t.name),
-    ['claims_release'],
-    'only claims_release removes state; every other write here appends',
+    ['federation_join', 'federation_publish', 'claims_release', 'channel_publish'],
+    'destructive tools must include claim removal and append-only sends that cannot be retracted',
   );
 });
 
@@ -529,13 +602,15 @@ test('review endpoint: legacy /mcp keeps its full surface, secret arguments incl
   assert.equal(legacy.length, 14, 'legacy /mcp must still advertise all 14 tools');
   assert.ok(names.includes('federation_invite_mint'), 'membership admin must remain on /mcp');
   assert.ok(names.includes('federation_admit'), 'membership admin must remain on /mcp');
-  // The adminToken ARGUMENT is legacy behaviour and must survive intact.
+  // The adminToken ARGUMENT is legacy behaviour and must remain available. It is
+  // optional at schema level because OAuth can authorize publishing without it;
+  // the handler still refuses calls that have neither credential.
   const gatedByArg = legacy
-    .filter((t) => (t.inputSchema.required ?? []).includes('adminToken'))
+    .filter((t) => Object.hasOwn(t.inputSchema.properties ?? {}, 'adminToken'))
     .map((t) => t.name).sort();
   assert.deepEqual(gatedByArg,
-    ['channel_publish', 'claims_issue', 'claims_release', 'federation_admit', 'federation_invite_mint', 'federation_join', 'federation_publish'].sort(),
-    'legacy /mcp must still take adminToken as a tool argument');
+    ['channel_publish', 'claims_issue', 'claims_release', 'federation_admit', 'federation_invite_mint', 'federation_join', 'federation_publish', 'seraphina_guidance'].sort(),
+    'legacy /mcp must still expose adminToken as a service-side tool argument');
   gw.close();
 });
 
@@ -602,15 +677,22 @@ test('review endpoint: dropping the argument did NOT drop the gate', async () =>
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
     body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'federation_join', arguments: { name: 'probe' } } }),
-  }).then((r) => r.text());
+  }).then(async (r) => ({ status: r.status, challenge: r.headers.get('www-authenticate'), text: await r.text() }));
 
-  assert.match(await call({}), /admin token required or invalid/, 'no credential must be refused');
-  assert.match(await call({ authorization: 'Bearer wrong-token' }), /admin token required or invalid/, 'a wrong credential must be refused');
-  assert.match(await call({ 'x-ruflo-admin-token': 'wrong-token' }), /admin token required or invalid/, 'a wrong header credential must be refused');
+  for (const result of [
+    await call({}),
+    await call({ authorization: 'Bearer wrong-token' }),
+    await call({ 'x-ruflo-admin-token': 'wrong-token' }),
+  ]) {
+    assert.equal(result.status, 401, 'a refused review write must be an HTTP OAuth challenge');
+    assert.match(result.challenge || '', /oauth-protected-resource\/chatgpt\/mcp/);
+  }
   // With the RIGHT credential the gate opens: the call gets past `checkAdmin` and
   // fails further in, trying to reach the (unreachable) test relay. The point is
   // that it is no longer the credential refusal.
-  assert.doesNotMatch(await call({ authorization: 'Bearer test-admin-token' }), /admin token required or invalid/);
+  const accepted = await call({ authorization: 'Bearer test-admin-token' });
+  assert.notEqual(accepted.status, 401);
+  assert.doesNotMatch(accepted.text, /admin token required or invalid/);
   gw.close();
 });
 
